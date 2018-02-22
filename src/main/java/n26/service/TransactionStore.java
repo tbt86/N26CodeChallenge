@@ -3,8 +3,8 @@ package n26.service;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import lombok.extern.slf4j.Slf4j;
 import n26.model.InvalidTimestampException;
 import n26.model.Statistics;
@@ -22,7 +22,7 @@ public class TransactionStore {
     // Bucket sizes are defined in MS by {@link TransactionStore#BUCKET_SIZE_MS}
     // Number of entries in the map is defined by
     // STATISTICS_WINDOW_SECONDS * 1000 / BUCKET_SIZE_MS
-    private final Map<Long, Statistics> statisticsMap = new HashMap<>();
+    private final Map<Long, Statistics> statisticsMap;
 
     // The clock used to retrieve the current time
     private final Clock clock;
@@ -42,6 +42,7 @@ public class TransactionStore {
         this.clock = clock;
         currentBucket = new Statistics();
         currentBucketIndex = getBucketIndex(Instant.now(clock).toEpochMilli());
+        statisticsMap = new ConcurrentHashMap<>();
     }
 
     /**
@@ -54,16 +55,23 @@ public class TransactionStore {
 
         final long index = getBucketIndex(transaction.getTimestamp());
 
-        if (index == currentBucketIndex) {
-            currentBucket.addTransaction(transaction);
-        } else if (isInFutureBucket(transaction.getTimestamp())) {
-            commitCurrentBucket(currentBucketIndex);
-            currentBucketIndex = index;
-            currentBucket.addTransaction(transaction);
-        } else {
-            addToStatisticsMap(transaction, index);
+        synchronized (currentBucket) {
+            boolean isInFutureBucket = isInFutureBucket(transaction.getTimestamp());
+            if (index == currentBucketIndex || isInFutureBucket) {
+                if (isInFutureBucket) {
+                    commitCurrentBucket(currentBucketIndex);
+                }
+                updateCurrentBucket(transaction, index);
+                return;
+            }
         }
 
+        addToStatisticsMap(transaction, index);
+    }
+
+    private void updateCurrentBucket(Transaction transaction, long index) {
+        currentBucketIndex = index;
+        currentBucket.addTransaction(transaction);
     }
 
     /**
@@ -76,8 +84,10 @@ public class TransactionStore {
      */
     public Statistics getStatistics(Instant now) {
         // Check if we need to add the current bucket to the statistics
-        if (isInFutureBucket(now.toEpochMilli())) {
-            commitCurrentBucket(currentBucketIndex);
+        synchronized (currentBucket) {
+            if (isInFutureBucket(now.toEpochMilli())) {
+                commitCurrentBucket(currentBucketIndex);
+            }
         }
 
         final Statistics totalStats = new Statistics();
